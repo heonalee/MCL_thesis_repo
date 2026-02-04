@@ -94,10 +94,9 @@ print(paste("Proportion of missing values:",
             round(sum(is.na(mcl_unfiltered)) / length(as.matrix(mcl_unfiltered)) * 100, 2), "%"))
 ```
 
-### Initial visualiztaion of NAs
+### Initial visualization of NAs
 
 ```{r visualize NAs first for r1 and r2}
-library(tidyverse)
 
 # Process both replicates together
 missing_per_sample <- bind_rows(
@@ -144,6 +143,7 @@ mcl <- mcl_unfiltered %>%
 ```
 I convert NaN to NA and remove rows with only NA, then check the data again.
 
+### Data on protein identified
 ```{r convert NaN and check data}
 #convert NaN to NA
 mcl[mcl == "NaN"] <- NA_integer_
@@ -154,10 +154,19 @@ mcl[,-c(1:2)][mcl[,-c(1:2)] == "0"] <- NA_integer_
 #remove rows with only NA
 mcl <- mcl %>%
   filter(rowSums(is.na(mcl[,-c(1:2)])) != ncol(mcl[,-c(1:2)]))
-
-#data check
+```
+Data check:
+```{r print metrics for NA}
 dim(mcl)
-print(paste("Total number of missing values: ", sum(is.na(mcl))))
+print(paste("Total number of proteins identified:", nrow(mcl)))
+
+na_per_sample <- colSums(is.na(mcl[,-c(1:2)]))
+
+print(paste("Median number of proteins identified per sample:", nrow(mcl) - median(na_per_sample)))
+print(paste("Minimum number of proteins identified per sample:", nrow(mcl) - max(na_per_sample)))
+print(paste("Maximum number of proteins identified per sample:", nrow(mcl) - min(na_per_sample)))
+
+print(paste("Total number of missing values:", sum(is.na(mcl))))
 print(paste("Proportion of missing values:", 
             round(sum(is.na(mcl)) / length(as.matrix(mcl)) * 100, 2), "%"))
 print(paste("Negative values:", sum(mcl[sapply(mcl, is.numeric)] < 0, na.rm = TRUE)))
@@ -174,9 +183,90 @@ print(paste("Number of duplicated features: ", sum(duplicated(mcl$uniprot_id))))
 print(paste("Number of duplicated samples: ", sum(duplicated(colnames(mcl[,-c(1:2)])))))
 ```
 
+### Raw data distribution of mcl
+
+inspect how the data is distributed without any correction
+
+```{r raw data distribution}
+
+order_vec <- colnames(mcl[,-c(1:2)])
+
+# both plots without legend
+p1 <- mcl %>%
+  dplyr::select(-gene_id) %>%
+  pivot_longer(!uniprot_id, names_to = "Prot_id", values_to = "intensity") %>%
+  mutate(splitter = Prot_id) %>%
+  separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+  filter(grepl("_r1_", Prot_id)) %>%
+  ggplot(aes(factor(Prot_id, levels = order_vec), log2(intensity), fill = plex)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(size = 5, angle = 90, hjust = 1, vjust = 1),
+        legend.position = "none") +
+  labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+  scale_fill_brewer(palette = "Set3")
+
+p2 <- mcl %>%
+  dplyr::select(-gene_id) %>%
+  pivot_longer(!uniprot_id, names_to = "Prot_id", values_to = "intensity") %>%
+  mutate(splitter = Prot_id) %>%
+  separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+  filter(grepl("_r2_", Prot_id)) %>%
+  ggplot(aes(factor(Prot_id, levels = order_vec), log2(intensity), fill = plex)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(size = 5, angle = 90, hjust = 1, vjust = 1),
+        legend.position = "none") +
+  labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+  scale_fill_brewer(palette = "Set3")
+
+# legend from one plot
+legend <- get_legend(
+  p1 + theme(legend.position = "right")
+)
+
+# combine plots and legend
+plot_grid(
+  plot_grid(p1, p2, nrow = 2),
+  legend,
+  rel_widths = c(1, 0.1)
+)
+```
+This boxplot visualization of raw protein intensities on a log₂-scale reveals consistent intensity distributions between replicates while showing variations both within and across plexes indicating the need for normalization.
+
+
+### Replicate correlation
+
+Each plex was measured in two replicates - they should be similar - so we investigate the correlation between both replicates.
+
+```{r Heatmap replicate correlation}
+
+mcl_rep1 <- mcl %>%
+  dplyr::select(contains("r1"))
+mcl_rep2 <- mcl %>%
+  dplyr::select(contains("r2"))
+
+#set the color-vector 
+color_fun_corr = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+
+cor(mcl_rep1, mcl_rep2, method = "spearman", use = "pairwise.complete.obs") %>%
+  Heatmap(as.matrix(.),
+                   column_title = "Replicate 1",
+                   row_title = "Replicate 2",
+                   col = color_fun_corr,
+                   show_row_names = FALSE,
+                   show_column_names = FALSE,
+                   cluster_rows = FALSE,
+                   cluster_columns = FALSE,
+                   name = "Spearman's R") %>%
+  draw()
+```
+This shows an acceptable correlation, though optimal would be a higher contrast between the diagonal and off-diagonal correlations. Still, we can combine the replicate values to an average value.
+
+
 ### Combine replicates & reshape dataframe from wide to long
 
-I combine the replicated to a dataframe with the average of r1 and r2.
+I combine the replicates to a dataframe with the average of r1 and r2.
 
 ```{r combine replicates}
 mcl_r1 <- mcl %>%
@@ -202,6 +292,449 @@ mcl_avg <- mcl_long %>%
 mcl_avg[mcl_avg == "NaN"] <- NA_integer_
 ```
 
+### Visualize NAs
+
+```{r visualize NAs of mcl_avg}
+comb <- mcl_avg %>%
+  group_by(samples_r1) %>%
+  summarise(na_rate = sum(is.na(avg_count))) %>%
+  mutate(samples_r2 = samples_r1) %>% 
+  separate(samples_r2, c("remove", "Plex"), sep = "r1_") %>% 
+  mutate(na_perc = na_rate / nrow(mcl)) 
+
+ggplot(comb, aes(
+    x = forcats::fct_reorder(samples_r1, na_perc),
+    y = na_perc,
+    fill = Plex
+  )) +
+  geom_col() +
+  theme_cowplot() +
+  labs(x = "samples", y = "[%] of proteins missing") +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line.y =  element_line(colour = "black"),
+    axis.line.x =  element_line(colour = "black"),
+    axis.text.y = element_text(colour = "black"),
+    legend.title = element_blank(),
+    axis.text.x = element_text(
+      size = 6,
+      angle = 90,
+      hjust = 1,
+      vjust = 1
+    ),
+    legend.position = "none"
+  ) 
+```
 
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+### Reference channel correlation
+
+The reference channel is the 11th sample, so I only select the 11th sample of each plex as ref_cor.
+
+Then, cor() calculates the pairwise Spearman correlations for the selected columns starting with 11, considering only complete observations (pairwise.complete.obs).
+The resulting correlation matrix is converted to a data frame using as.data.frame().
+The mutate() function adds new column "type" with the value "ref" to distinguish it as the reference-channel correlation.
+pivot_longer() converts the correlation matrix from wide format to long format, resulting in a tibble with two columns: "Prot_id" and "count" (the correlation values) filter(count != 1) removes self-correlation values (correlation of a variable with itself), as these values are always 1 in correlation matrices.
+
+```{r ref channel correlation}
+mcl_wide <- mcl_avg %>%
+  dplyr::select(c("uniprot_id", "samples_r1", "avg_count")) %>% #mcl_wide has the average count, we only take the name of samples_r1 (in case of confusion)
+  pivot_wider(names_from = "samples_r1", values_from = avg_count)
+
+#reference-channel correlation 
+ref_cor11 <- mcl_wide %>%
+  dplyr::select(starts_with("11_")) %>% 
+  cor(., method = "spearman", use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  mutate(type = "ref") %>%
+  pivot_longer(!c(type), names_to = "samples", values_to = "count") %>%
+  filter(count != 1)
+
+head(ref_cor11, n = 5)
+
+ref_cor <- ref_cor11[duplicated(ref_cor11$count),] # remove duplicates that appear twice bc of pivot_longer
+
+head(ref_cor, n = 5)
+
+ggplot(ref_cor, aes(count)) +
+  geom_density(fill = "#2a9d8f") +
+  cowplot::theme_cowplot() +
+  labs(x = "Spearman's R" ) 
+```
+The reference channel correlation ensures that measurements are accurate and not biased by technical irregularities. Spearman’s R showed an overall positive correlation for reference channels and a peak around 0.8, when ideally it would be at > 0.9. This sub-optimal correlation suggested the presence of technical variation between plexes, requiring batch effect correction.
+
+## Sample loading normalization
+
+To correct for differences in total protein amount loaded across samples and plexes, sample loading normalization is applied. A "target" is defined as the median total intensity across all samples (median of all column sums). For each sample, a normalization factor is calculated by dividing the target by the sample’s total intensity. 
+Each protein intensity value is then multiplied by its corresponding normalization factor, scaling all samples to a common total intensity level while preserving the relative differences between individual proteins. To verify successful normalization, protein intensities are again visualized by boxplots on a log2-scale.
+
+```{r sample loading normalization}
+library(dplyr)
+
+# create a vector of plexes
+plex_vec <- unique(
+  stringr::str_remove(
+    colnames(mcl[,-c(1,2)]), 
+    "._r1_|._r2_|.._r1_|.._r2_")
+  ) 
+
+# Store each plex into a list embedment
+plex_list <- list() 
+
+for(i in plex_vec) {
+  plex_list[[i]] <- mcl %>% 
+    dplyr::select(contains(i))
+}
+
+#create the target scaling factor 
+colsum_vec <- c() 
+
+for(i in plex_vec) {
+  df <- plex_list[[i]]
+  colsum_vec <- c(colsum_vec, colSums(df, na.rm = TRUE))
+}
+
+target <- median(colsum_vec, na.rm = TRUE)
+
+#correct per plex with a helper function
+run_sl_correct <- function(Y) { 
+  norm_facs <- target / colSums(Y, na.rm = TRUE) # calculate normalization factor for each column in matrix Y
+  output_sl <- sweep(Y, 2, norm_facs, FUN = "*") # multiplies norm_facs with each column
+  return(output_sl) # output_sl is the normalized matrix
+}
+
+data_sl_repl <- plex_list%>%
+  purrr::map(run_sl_correct) %>% 
+  bind_cols()
+```
+visualize effect
+
+```{r plot with one legend for thesis}
+# Plots without legends
+p1 <- data_sl_repl %>%
+  tibble::rownames_to_column("n") %>%
+  pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+  mutate(splitter = Prot_id) %>%
+  separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+  filter(grepl("_r1_", Prot_id)) %>%
+  ggplot(aes(
+    factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+  )) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(
+    size = 6,
+    angle = 90,
+    hjust = 1,
+    vjust = 1
+  ),
+  legend.position = "none") +
+  labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+  scale_fill_brewer(palette = "Set3")
+
+p2 <- data_sl_repl %>%
+  tibble::rownames_to_column("n") %>%
+  pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+  mutate(splitter = Prot_id) %>%
+  separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+  filter(grepl("_r2_", Prot_id)) %>%
+  ggplot(aes(
+    factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+  )) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(
+    size = 6,
+    angle = 90,
+    hjust = 1,
+    vjust = 1
+  ),
+  legend.position = "none") +
+  labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+  scale_fill_brewer(palette = "Set3")
+
+# Extract legend from one plot
+legend <- get_legend(
+  p1 + theme(legend.position = "right")
+)
+
+# combine plots and legend
+plot_grid(
+  plot_grid(p1, p2, nrow = 2),
+  legend,
+  rel_widths = c(1, 0.1)
+)
+```
+After sample loading normalization protein intensities are effectively balanced across all samples. The boxplots show aligned medians and comparable intensity distributions across both replicates and plexes, indicating successful correction of technical variability in protein loading.
+
+### Correlation between random sets of channels
+
+I am comparing the ones with TMT-label 129C since they are present in every plex.
+
+```{r corr between random sets after normalization}
+library(psych)
+
+sl_data <- data_sl_repl %>%
+  dplyr::select(contains("r1")) %>%
+  dplyr::select(contains(plex_vec[1:9])) %>%
+  dplyr::select(contains("7_"))
+
+pairs.panels(log2(sl_data), lm = TRUE, main = "Random channel 129C over plexes")
+```
+
+## Principal Component analysis (PPCA)
+
+Let's further have a look into the general structure in the dataset by PCA.
+Since we are working with a dataset that contains missing data, we probabilistic PCA (pPCA) that accounts for missing data <http://www.cs.columbia.edu/~blei/seminar/2020-representation/readings/TippingBishop1999.pdf>.
+
+Highly correlated samples cluster together in a 2D graph The axes are ranked in order of importance - differences along x axis (PC1 = principle component 1) are more important than differences along the 2nd principal component on y-axis (PC2)
+
+The scales: Large absolute values (e.g., -60 or 20) indicate that those samples differ significantly from the average sample along that principal component.
+Smaller values (closer to 0) suggest that a sample is near the dataset’s mean in that dimension.
+
+```{r initial pca}
+library(pcaMethods)
+library(scrime)
+
+threshold <- 0.5
+
+ppca_df <- data_sl_repl %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_fill_brewer(palette = "Set3") +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) 
+  
+```
+
+This is the PCA of the mcl data that was corrected with the normalization factor.
+The PCA reveals prominent clustering of samples according to their plex membership, confirming that batch effects were a major source of variance in the dataset. 
+
+
+## Internal reference scaling
+
+The reference channel (channel 11, containing an identical pooled sample in each plex) serves as the basis for reference for protein-wise scaling within each plex.
+For each protein, the geometric mean of intensities across all reference channels is defined as the reference average. A scaling factor is calculated by dividing the ref-erence average by the observed value in the reference channel of a plex. All values of that protein within the plex were then multiplied with the corresponding plex- and protein-specific scaling factor. 
+
+```{r internal reference scaling}
+#make a dataframe of the reference channels per plex 
+irs_factors <- data_sl_repl %>% 
+  dplyr::select(contains("11_"))
+
+#calculate the geometric mean per sample as global reference for scaling
+irs_factors$geomean <- apply(irs_factors, 1, function(x) exp(mean(log(x), na.rm = TRUE)))
+
+#pull out sample names to identify  !!! Adjust removal position to geomeam column
+irs_factor_vec = as.vector(names(irs_factors[,-c((length(plex_vec)*2)+1)]))
+irs_factor_vec
+
+#create the protein and reference channel wise scaling factor
+for(i in irs_factor_vec) {
+  factor <-  irs_factors$geomean / (irs_factors %>% dplyr::select(i))
+  irs_factors[,paste0("fac_",i)] <- factor
+}
+
+irs_mult <- colnames(irs_factors %>% dplyr::select(contains("fac"))) %>% as.data.frame
+
+irs_mult <- cbind(irs_mult, irs_mult) 
+
+colnames(irs_mult) <- c("factor", "exp")
+
+irs_mult<- irs_mult %>%
+  separate(exp, c("discard", "plex"), sep = "\\_11_") %>%
+  dplyr::select(-discard) %>%
+  filter(plex !=  "r1_753") # i just took the first plex to start with
+
+irs_mult_vec = as.vector(irs_mult$plex)
+
+irs_fac_filt <- irs_factors %>% dplyr::select(contains("fac"))
+
+all_irs <- (data_sl_repl %>% dplyr::select(contains( "r1_753"))) * unlist(irs_fac_filt %>% dplyr::select(contains( "r1_753"))) # starting with the first plex, the scaling is applied on all samples
+
+for(i in irs_mult_vec) {
+  all_irs <- cbind(all_irs, (data_sl_repl %>% dplyr::select(contains(i))) * unlist(irs_fac_filt %>% dplyr::select(contains(i))))
+}
+```
+visualize effect
+
+```{r boxplots after internal reference scaling}
+# Create plots without legends
+p1 <- all_irs %>%
+  tibble::rownames_to_column("n") %>%
+  pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+  mutate(splitter = Prot_id) %>%
+  separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+  filter(grepl("_r1_", Prot_id)) %>%
+  ggplot(aes(
+    factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+  )) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(
+    size = 6,
+    angle = 90,
+    hjust = 1,
+    vjust = 1
+  ),
+  legend.position = "none") +
+  labs(x = "", y = "log2(intensity)", title = "Replicate 1") +
+  scale_fill_brewer(palette = "Set3")
+
+p2 <- all_irs %>%
+  tibble::rownames_to_column("n") %>%
+  pivot_longer(!n, names_to = "Prot_id", values_to = "intensity") %>%
+  mutate(splitter = Prot_id) %>%
+  separate(splitter, c("remove", "plex"), sep = "_r1_|_r2_") %>%
+  filter(grepl("_r2_", Prot_id)) %>%
+  ggplot(aes(
+    factor(Prot_id, levels = order_vec), log2(intensity), fill = plex
+  )) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(
+    size = 6,
+    angle = 90,
+    hjust = 1,
+    vjust = 1
+  ),
+  legend.position = "none") +
+  labs(x = "", y = "log2(intensity)", title = "Replicate 2") +
+  scale_fill_brewer(palette = "Set3")
+
+# Extract legend from one plot
+legend <- get_legend(
+  p1 + theme(legend.position = "right")
+)
+
+# Combine plots and legend
+plot_grid(
+  plot_grid(p1, p2, nrow = 2),
+  legend,
+  rel_widths = c(1, 0.15)
+)
+```
+
+### Correlation between random set of channels after IRS
+
+```{r correlation between random set of channels 2}
+sl_test_data <- all_irs %>%
+  dplyr::select(contains("r1")) %>%
+  dplyr::select(contains(plex_vec[1:9])) %>%
+  dplyr::select(contains("7_"))
+
+pairs.panels(log2(sl_test_data), lm = TRUE, main = "Random channel 129C over plexes")
+
+```
+
+### PPCA after IRS
+```{r check ppca}
+ppca_df <- all_irs %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Number", "Plex"), sep = "_r1_|_r2_")
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_fill_brewer(palette = "Set3") +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+
+```
+
+After internal reference scaling, data consistency was enhanced, improving reliability of downstream analyses. Correlation analysis of a random channel (channel 7) across plexes showed increased correlations (ρ ≈ 0.91–0.98) compared to pre-IRS values (ρ ≈ 0.63–0.80), confirming successful batch correction.
+However, PPCA reveals that samples still clustered by plex, indicating residual batch effects requiring further correction. 
+
+## Average replicates and log2-transform
+
+I now average replicate values to a single value per protein per sample to create mcl_proteome_final. 
+
+```{r merge replicates in smaller codes}
+mcl_norm <- cbind(mcl[,c(1)], all_irs) %>%
+  dplyr::select(-contains("11_"))
+
+colnames(mcl_norm)[1] <- "uniprot_id"
+
+# create the datasets for r1 and r2 first separately
+mcl_long_norm_r1 <- mcl_norm %>%
+    dplyr::select(uniprot_id, contains("r1")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id1",
+                        values_to = "count_R1")
+
+mcl_long_norm_r2 <- mcl_norm %>%
+    dplyr::select(uniprot_id, contains("r2")) %>%
+    tidyr::pivot_longer(!uniprot_id,
+                        names_to = "Prot_id2",
+                        values_to = "count_R2") 
+
+head(mcl_long_norm_r1, n = 3)
+head(mcl_long_norm_r2, n = 3)
+
+# now merge and leave out uniprot_id (first col) from r2 dataset
+
+mcl_long_norm <- cbind(mcl_long_norm_r1, mcl_long_norm_r2[, -1]) 
+
+mcl_long_norm <- mcl_long_norm %>%
+  rowwise() %>%
+  mutate(avg_count = mean(c(count_R1, count_R2), na.rm = TRUE))
+
+#reformat the NA 
+mcl_long_norm$avg_count[mcl_long_norm$avg_count == "NaN"] <- NA_integer_
+
+mcl_wide_norm <- mcl_long_norm %>% 
+  dplyr::select(uniprot_id, Prot_id1, avg_count) %>%
+  pivot_wider(names_from = "Prot_id1", values_from = "avg_count")
+
+```
+
+Assign the gene_ids to the samples and log2-transform
+
+```{r assign names to samples}
+m_comb <- as.matrix(mcl_wide_norm[,-1])
+
+rownames(m_comb) <- mcl_wide_norm$uniprot_id
+
+# t() function swaps rows and cols
+
+t_comb <- t(m_comb) %>% 
+  as.data.frame() %>%
+  rownames_to_column("Pre_id") %>%
+  separate(Pre_id, c("number", "plex"), sep = "_r1_") %>%
+  mutate(plex = paste0("P", as.character(plex))) %>%
+  mutate(plex = paste0(as.character(plex), as.character(number))) %>%
+  dplyr::select(-number) %>% 
+  column_to_rownames("plex")
+
+mcl_proteome <-
+  t(t_comb) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("uniprot_id")
+
+uniprot_gene_mcl <- mcl %>% dplyr::select(uniprot_id, gene_id) 
+
+mcl_proteome_final <-  left_join(uniprot_gene_mcl, mcl_proteome, by  = "uniprot_id") 
+
+mcl_proteome_final[,3:ncol(mcl_proteome_final)]<- sapply(mcl_proteome_final[,3:ncol(mcl_proteome_final)], as.numeric)
+
+mcl_proteome_final[,3:ncol(mcl_proteome_final)] <- log2(mcl_proteome_final[,3:ncol(mcl_proteome_final)]) # log-transformed!
+
+head(mcl_proteome_final, n = 5)
+```

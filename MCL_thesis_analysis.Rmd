@@ -48,9 +48,275 @@ library(readxl)
 library(limma)
 library(sva)
 library(stringr)
+library(visdat)
+library(DreamAI)
+library(BayesDeBulk)
+library(umap)
+library(cola)
 ```
 
 # MCL 1-100 Data Analysis
+
+# RNA data 
+
+## Import the data & merge
+I have RNA1 and RNA2 from 2 different sources and have to unite them.
+```{r rna data extraction}
+## RNA data extraction
+
+rna_1 <- readRDS("/Users/heona/git-repos/MCL_thesis_repo/data/raw_data/20250303_MCL_RNAseq1.rds")
+rna_2 <- readRDS("/Users/heona/git-repos/MCL_thesis_repo/data/raw_data/20250303_MCL_RNAseq2.rds") 
+
+print(paste("Missing values in rna_1:", sum(is.na(rna_1))))
+print(paste("Missing values in rna_2:", sum(is.na(rna_2))))
+
+rna_1_data <- rna_1 %>%
+  as.data.frame() %>%
+  dplyr::select(where(~ !any(is.na(.))))
+
+rna_2_data <- rna_2 %>%
+  as.data.frame() %>%
+  dplyr::select(where(~ !any(is.na(.))))
+```
+
+First, I need to unify the column names.
+
+dplyr::select(any_of(colnames(rna_data))) searches for overlapping column names, we still have different column names in each matrix - I have to change them to have uniform colnames.
+
+```{r rna 1 and 2 mapping and unifying colnames}
+mapping <- read_excel("/Users/heona/git-repos/MCL_thesis_repo/data/raw_data/20240830_MCL_IDs_Heona_V2_reduced.xlsx") 
+
+#create a name vector, which replaces the RNAseq_ID names with the MS2_ID names
+name_map <- setNames (mapping$MS2_ID, mapping$RNAseq_ID)
+
+# rename columns in rna_2_data
+colnames(rna_2_data) <- ifelse(colnames(rna_2_data) %in% names(name_map),
+                               name_map[colnames(rna_2_data)], 
+                               colnames(rna_2_data))
+
+#create a name vector, which replaces the Cegat_id names with the MS2_ID names
+name_map_2 <- setNames (mapping$MS2_ID, mapping$Cegat_id)
+
+# only keep the columns that could be mapped, omit the missing ones that are still named "S..."
+rna_2_data <- rna_2_data[, !grepl("^MCL", colnames(rna_2_data))]
+
+# rename columns in rna_1_data
+colnames(rna_1_data) <- ifelse(colnames(rna_1_data) %in% names(name_map_2),
+                               name_map_2[colnames(rna_1_data)], 
+                               colnames(rna_1_data))
+
+# only keep the columns that could be mapped, omit the missing ones that are still named "S..."
+rna_1_data <- rna_1_data[, !grepl("^S", colnames(rna_1_data))]
+cat("dimension of rna_1_data:", dim(rna_1_data), "\n")
+
+#hhow many gene names are overlapping
+cat("shared rownames:", sum(rownames(rna_1) %in% rownames(rna_2)), "\n")
+cat("rows only in rna_1:", sum(!(rownames(rna_1) %in% rownames(rna_2))), "\n")
+cat("rows only in rna_2:",sum(!(rownames(rna_2) %in% rownames(rna_1))), "\n")
+
+#to make a full join of rna 1 and 2, move rownames to a new column called "gene" - bc full_join can only work with columns, not rownames
+rna_1_data$gene <- rownames(rna_1_data)
+rna_2_data$gene <- rownames(rna_2_data)
+
+# now full_join by gene
+rna_data <- full_join(rna_1_data, rna_2_data, by = "gene")
+rownames(rna_data) <- rna_data$gene # set the column gene back to rownames
+rna_data$gene <- NULL # delete the column gene
+```
+rna_1_data and rna_2_data are from different labs and measured different genes.
+There are 9995 overlapping genes and about 5000 genes unique to rna_1 and 2000 unique to rna_2.
+
+## Merge with only shared genes
+
+For further analysis, we need to proceed with only the data on the genes that were shared between both datasets.
+
+```{r create rna_data_shared}
+shared_genes <- intersect(rownames(rna_1_data), rownames(rna_2_data))
+
+rna_data_shared <- cbind(rna_1_data[shared_genes, ], rna_2_data[shared_genes, ]) %>%
+  select(-gene)
+```
+
+## PCA
+
+```{r check for rna batch effect}
+
+sum(is.na(rna_data_shared))
+
+# 1. Filter out genes with too much missing data
+threshold <- 0.9
+rna_pca_df <- rna_data_shared %>%
+  filter(rowMeans(is.na(.)) < threshold)
+
+# Standard PCA (much faster)
+rna_pca <- prcomp(t(as.matrix(rna_pca_df)), center = TRUE, scale. = TRUE)
+
+# Extract scores
+pca_out <- as.data.frame(rna_pca$x[, 1:2]) %>%
+  rownames_to_column("Sample_ID")
+
+# For variance explained, use:
+var_explained <- summary(rna_pca)$importance[2, 1:2] * 100
+
+# 5. for ex. "928_04" is plex_sample
+pca_out <- pca_out %>%
+  separate(Sample_ID, into = c("Plex", "Sample"), sep = "_", remove = FALSE)
+
+# 6. Plot
+ggplot(pca_out, aes(PC1, PC2, color = Plex)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  xlab(paste0("PC1 (", round(var_explained[1], 2), "%)")) +
+  ylab(paste0("PC2 (", round(var_explained[2], 2), "%)")) +
+  labs(title = "PCA of shared RNA-seq Samples")
+```
+
+The PCA shows a strong batch effect between the two datasets, and also within the plexes.
+For BayesdeBulk, which we will perform with this rna data, it is crucial to not have any batch effects!
+
+
+## Data check
+
+```{r negative values and data range in rna data}
+# Count how many values are below 0 and get the range of negative values
+cat("=== rna_data_shared ===\n")
+cat("Total sum:", sum(rna_data_shared), "\n")
+cat("Data range:", range(rna_data_shared, na.rm = TRUE), "\n")
+cat("Negative values:", sum(rna_data_shared < 0, na.rm = TRUE), "\n")
+cat("Range of negative values:", range(rna_data_shared[rna_data_shared < 0], na.rm = TRUE), "\n\n")
+
+cat("=== rna_1_data ===\n")
+cat("Total sum:", sum(rna_1_data[ , sapply(rna_1_data, is.numeric)], na.rm = TRUE), "\n")
+cat("Data range:", range(rna_1_data[ , sapply(rna_1_data, is.numeric)], na.rm = TRUE), "\n")
+cat("Negative values:", sum(rna_1_data < 0, na.rm = TRUE), "\n")
+cat("Range of negative values:", range(rna_1_data[rna_1_data < 0], na.rm = TRUE), "\n\n")
+
+cat("=== rna_2_data ===\n")
+cat("Total sum:", sum(rna_2_data[ , sapply(rna_2_data, is.numeric)], na.rm = TRUE), "\n")
+cat("Data range:", range(rna_2_data[ , sapply(rna_2_data, is.numeric)], na.rm = TRUE), "\n")
+cat("Negative values:", sum(rna_2_data < 0, na.rm = TRUE), "\n")
+cat("Range of negative values:", range(rna_2_data[rna_2_data < 0], na.rm = TRUE), "\n")
+
+```
+Expression values ranged from approximately -2,8 to 16,2 in samples from lab 1 and from -3,5 to 18,3 in samples from lab 2.
+
+### Normalization pattern
+
+Since I have negative values in my RNA datasets that hinder batch correction methods to function, I want to check if my RNA data is normalized and that is the cause of the negative values.
+
+```{r check normalization in rna}
+library(tidyverse)
+library(cowplot)
+
+rna_data_shared %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expression") %>%
+  separate(sample, into = c("plex", "number"), sep = "_", remove = FALSE) %>%
+  ggplot(aes(x = sample, y = expression, fill = plex)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 90, size = 6, vjust = 0.5, hjust = 1)) +
+  labs(x = "", y = "log2 (expression)") +
+  scale_fill_brewer(palette = "Set3")
+
+# Density plots
+rna_data_shared %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expression") %>%
+  separate(sample, into = c("plex", "number"), sep = "_", remove = FALSE) %>%
+  ggplot(aes(x = expression, color = plex)) +
+  geom_density() +
+  theme_classic() +
+  labs(x = "log2 (expression)", color = "Plex") +
+  scale_color_brewer(palette = "Set3")
+
+rna_data_shared %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expression") %>%
+  separate(sample, into = c("plex", "number"), sep = "_", remove = FALSE) %>%
+  ggplot(aes(x = expression, color = plex, fill = plex, group = sample)) +
+  geom_density(fill = NA) +
+  theme_classic() +
+  labs(x = "log2 (expression)", color = "Plex", fill = "Plex") +
+  scale_color_brewer(palette = "Set3") +
+  scale_fill_brewer(palette = "Set3")
+
+# Check column medians
+rna_data_shared %>%
+  summarise(across(everything(), ~median(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "median") %>%
+  summary()
+```
+
+The boxplot visualization shows aligned medians within samples of the same lab origin, confirming normalization within each batch while revealing differences in normalization between the two laboratories
+
+
+## Batch correction with ComBat
+
+with lab origin as batch variable
+
+The samples starting with 9 are from rna_1, the samples starting with 7 are from rna_2.
+
+```{r combat on rna_data_shared}
+
+batch_vector <- ifelse(grepl("^9", colnames(rna_data_shared)), "rna_1", "rna_2")
+modcombat <- model.matrix(~1, data = data.frame(batch = batch_vector))
+
+rna_combat <- ComBat(dat = as.matrix(rna_data_shared),
+                        batch = batch_vector,
+                        mod = modcombat,
+                        par.prior = TRUE)
+```
+
+#### PCA after Batch correction
+
+```{r standard PCA of rna after combat}
+# Standard PCA
+rna_pca_corrected <- prcomp(t(as.matrix(rna_combat)), scale. = TRUE)
+
+# Create data frame for plotting
+pca_out_corrected <- as.data.frame(rna_pca_corrected$x[, 1:2]) %>%
+  rownames_to_column("Sample_ID") %>%
+  separate(Sample_ID, into = c("Plex", "Sample"), sep = "_", remove = FALSE)
+
+# Plot
+ggplot(pca_out_corrected, aes(PC1, PC2, color = Plex)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  xlab(sprintf("PC1 (%.2f%%)", summary(rna_pca_corrected)$importance[2,1] * 100)) +
+  ylab(sprintf("PC2 (%.2f%%)", summary(rna_pca_corrected)$importance[2,2] * 100)) +
+  labs(title = "PCA of rna_combat (After ComBat)")
+```
+
+color by lab origin:
+```{r standard PCA of rna after combat colored by lab origin}
+# Standard PCA
+pca_rna_combat <- prcomp(t(as.matrix(rna_combat)), scale. = TRUE)
+
+# Create data frame for plotting
+pca_df <- data.frame(
+  PC1 = pca_rna_combat$x[,1],
+  PC2 = pca_rna_combat$x[,2],
+  Sample_ID = rownames(pca_rna_combat$x)
+) %>%
+  mutate(Lab = ifelse(substr(Sample_ID, 1, 1) == "9", "RNA_1", "RNA_2"))
+
+# Plot
+ggplot(pca_df, aes(PC1, PC2, color = Lab)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("RNA_1" = "#E41A1C", "RNA_2" = "#377EB8")) +
+  theme_classic() +
+  labs(
+    x = sprintf("PC1 (%.1f%%)", summary(pca_rna_combat)$importance[2,1] * 100),
+    y = sprintf("PC2 (%.1f%%)", summary(pca_rna_combat)$importance[2,2] * 100),
+    title = "PCA of rna_combat (After ComBat) - colored by Lab"
+  )
+```
+
+It looks like the batch correction was successful, the dominant separation by lab has been eliminated.
+
+
+#Proteomic data
 
 ## Import the data
 
@@ -736,5 +1002,717 @@ mcl_proteome_final[,3:ncol(mcl_proteome_final)]<- sapply(mcl_proteome_final[,3:n
 
 mcl_proteome_final[,3:ncol(mcl_proteome_final)] <- log2(mcl_proteome_final[,3:ncol(mcl_proteome_final)]) # log-transformed!
 
-head(mcl_proteome_final, n = 5)
 ```
+### PPCA before HarmonizR
+
+```{r mcl_proteome_final ppca}
+ppca_df <- mcl_proteome_final[,-c(1,2)] %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  mutate(Plex = str_remove(str_sub(Prot_id, 1, 4), "P"))
+# sep = 4 means separate at the 4th string character
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_fill_brewer(palette = "Set3") +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+missingness distribution
+```{r final data NA distribution 1}
+comb_df <- comb %>%
+  dplyr::select(Plex, na_perc) %>%
+  group_by(Plex) %>%
+  summarise(na = mean(na_perc)) %>%
+  mutate(Plex = paste0("P", Plex, sep = ""))
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, c("Plex", "Number"), sep = 4) %>%
+  left_join(comb_df, 
+            by = "Plex")
+
+ggplot(ppca_out, aes(PC1, PC2, col = na)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c()+
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)")) +
+  labs(color = "% missing")
+```
+
+## HarmonizR 
+
+with Plex = Batch, and with specifying parameters
+
+HarmonizR integrates limma’s removeBatchEffect() function employing linear regres-sion and the batch effect correction method ComBat which uses an empirical Bayes framework. Unlike most harmonization tools that require complete datasets, HarmonizR can handle missing values by matrix dissection, without imputing or reducing data, which makes it suitable for proteomic data. 
+
+I use the normalized log-transformed data mcl_proteome_final for HarmonizR.
+
+```{r check missingness before HarmonizR}
+print(paste("Total number of missing values: ", sum(is.na(mcl_proteome_final))))
+prod(dim(mcl_proteome_final))
+print(sum(is.na(mcl_proteome_final)) / prod(dim(mcl_proteome_final)))
+```
+We have 21,57% missing values before applying harmonizr.
+
+```{r harmonizr specifying the correction parameters}
+# 1: Create the batch vector information
+# Extract sample names (excluding uniprot_id and gene_name columns)
+# make batch_df with cols: samplename, numbered ID and batch
+batch_df <- tibble(samplename = colnames(mcl_proteome_final[,-c(1,2)])) %>%
+  rowid_to_column("ID") %>%
+  relocate(ID, .after = samplename) %>%
+  mutate(
+    plex_number = sub("P(.{3}).*", "\\1", samplename),
+    batch = case_when(
+      plex_number == "753" ~ 1,
+      plex_number == "757" ~ 2,
+      plex_number == "764" ~ 3,
+      plex_number == "772" ~ 4,
+      plex_number == "775" ~ 5,
+      plex_number == "920" ~ 6,
+      plex_number == "928" ~ 7,
+      plex_number == "930" ~ 8,
+      plex_number == "935" ~ 9,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(samplename, ID, batch)
+
+# Check batch assignments
+table(batch_df$batch)
+
+# 2: Prepare dataframe for harmonization
+# Remove gene_name column and set uniprot_id as rownames
+harmonize_df <- mcl_proteome_final[,-2] %>%
+  column_to_rownames("uniprot_id")
+
+# 3: Run HarmonizR with explicit parameters
+mcl_harmonized <- harmonizR(
+  data_as_input = harmonize_df,
+  description_as_input = batch_df,
+  algorithm = "ComBat",
+  ComBat_mode = 3,  # parametric adjustment (1 = non-parametric if needed)
+  plot = "samplemeans"  # generates diagnostic plots
+)
+
+# 4: Convert back to dataframe with protein IDs
+mcl_proteome_harmonized <- mcl_harmonized %>%
+  as.data.frame() %>%
+  rownames_to_column("uniprot_id") %>%
+  left_join(mcl_proteome_final[, c("uniprot_id", "gene_id")], by = "uniprot_id") %>%
+  relocate(gene_id, .after = uniprot_id)
+
+# store files in the processed_data folder
+
+file.rename("cured_data.tsv", "data/processed_data/mcl_harmonized.tsv")
+file.rename("cured_data.pdf", "data/processed_data/mcl_harmonized_diagnostics.pdf")
+```
+
+###PPCA after HarmonizR
+
+```{r ppca mcl_proteome_harmonized}
+ppca_df <- mcl_proteome_harmonized[,-c(1,2)] %>% 
+  filter(rowMeans(is.na(.)) < threshold) %>%
+  #feature-wise scaling and centering 
+  rowScales() %>%
+  as.data.frame()
+
+data_ppca <- pcaMethods::pca(t(as.matrix(ppca_df)), method = "ppca", nPcs = 2, seed = 123)
+
+ppca_out <- as.data.frame(scores(data_ppca)) %>%
+  rownames_to_column("Prot_id") %>%
+  separate(Prot_id, into = c("Plex", "Number"), sep = 4)
+# sep = 4 means separate at the 4th string character
+
+ggplot(ppca_out, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_fill_brewer(palette = "Set3") +
+  theme_classic() +
+  xlab(paste("PC1 (", round(data_ppca@R2[1] * 100, digits = 2), "%)")) +
+  ylab(paste("PC2 (", round(data_ppca@R2[2] * 100, digits = 2), "%)"))
+```
+
+HarmonizR successfully corrected the batch effects.
+We proceed with mcl_proteome_harmonized for our missing value imputation.
+
+## Mapping and unifying colnames
+
+```{r prot data unify colnames}
+# for protein data, create a name vector, which replaces the MS_Label names with the MS2_ID names
+name_map_ms <- setNames (mapping$MS2_ID, mapping$MS_Label)
+
+proteome_data_log <- mcl_proteome_harmonized
+
+# rename columns in mcl_proteome_cured_data to "753_01" to fit the same format -> prot_data
+colnames(proteome_data_log) <- ifelse(colnames(proteome_data_log) %in% names(name_map_ms),
+                               name_map_ms[colnames(proteome_data_log)], 
+                               colnames(proteome_data_log))
+
+```
+
+proteome_data_log now has the same colnames as the rna_data_shared
+
+We still have multiple genes in some gene_id rownames, that are seperated by ";" So we select one of the genes (the first) and drop the rest.
+If the first of the row is already taken prior, the next is selected as unique identifier.
+
+
+### Create unique gene_id identifiers
+
+```{r unique gene_id identifiers - log transformed data}
+# A vector to keep track of the genes that have already been used
+used_genes <- c()
+
+# A vector to store the new, unique gene IDs
+unique_gene_id <- sapply(proteome_data_log$gene_id, function(genes_str) {
+  
+  # Split the string of genes by the semicolon
+  candidate_genes <- str_split(genes_str, ";")[[1]]
+  
+  # Find the first gene in the list that has not been used yet
+  for (gene in candidate_genes) {
+    if (!gene %in% used_genes) {
+      used_genes <<- c(used_genes, gene) # If found, add it to our list of used genes
+      return(gene) # Return this gene as the chosen one for this row
+    }
+  }
+  # If no unique gene is found for this row (all candidates were already used),
+  # return NA as a placeholder.
+  return(NA_character_)
+}) 
+
+# Add the new column of unique gene IDs to dataframe
+proteome_data_log$unique_gene_id <- unique_gene_id
+
+prot_data_log <- proteome_data_log %>%
+  select(uniprot_id, gene_id, unique_gene_id, everything())
+
+sum(is.na(unique_gene_id))
+```
+
+165 rows cannot be matched with a unique_gene_id, and thus have to be removed. We only work with those that have both gene_id and uniprot_id because we focus on the features that are gene/protein-code.
+
+```{r prot_data only select columns unique_gene_id and samples - log transformed data}
+prot_data_final_log <- prot_data_log %>%
+  select(-uniprot_id, -gene_id) %>%
+  filter(!is.na(unique_gene_id)) 
+
+rownames(prot_data_final_log) <- prot_data_final_log$unique_gene_id
+prot_data_final_log <- prot_data_final_log[,-1]
+```
+
+## DreamAI 
+
+In order to apply BayesDeBulk deconvolution analysis with RNA and protein data, we need our datasets to be free of missing values.
+To impute the missing values I use DreamAI.
+
+### Missing values
+```{r missing values exploration - mcl_proteome_harmonized}
+
+na_percentage <- rowMeans(is.na(prot_data_final_log)) * 100 #
+rows_above_50_na <- which(na_percentage > 50)
+
+row_lowest_na <- which.min(na_percentage) 
+min_na_percentage <- na_percentage[row_lowest_na] 
+
+row_highest_na <- which.max(na_percentage) 
+max_na_percentage <- na_percentage[row_highest_na] 
+
+# Proportion of rows with >50% missing values
+proportion_above_50_na <- sum(na_percentage > 50) / nrow(mcl_proteome_harmonized) *100
+
+# Output results
+list(
+  num_rows_above_50_na = sum(na_percentage > 50),
+  row_lowest_na = row_lowest_na,
+  min_na_percentage = min_na_percentage,
+  row_highest_na = row_highest_na,
+  max_na_percentage = max_na_percentage,
+  proportion_above_50_na = proportion_above_50_na
+)
+```
+
+### Filtering for DreamAI
+As a preparation, we need to filter the rows that have NA > 50%, 
+We only take the columns that are also found in RNA data. For some, RNA data was missing and we have to exclude these.
+
+```{r refine prot_data_final - log transformed data}
+sum(is.na(prot_data_final_log))
+
+# for DreamAI limit the threshold of missing values to 0.5
+threshold <- 0.5
+
+prot_data_final_dai_log <- prot_data_final_log %>%
+  filter(rowMeans(is.na(.[,])) < threshold) %>%
+  select(, any_of(colnames(rna_combat))) # only the columns which are found in rna_data. bc for some, rna data was missing and we have to exclude these
+
+sum(is.na(prot_data_final_dai_log))
+
+dim(prot_data_final_log)
+dim(prot_data_final_dai_log)
+dim(rna_combat)
+```
+The dimensions are now matched between RNA and protein data.
+
+### Missing values after filtering
+
+Before I run DreamAI, I want to see, how many missing values there are.
+
+```{r missing values right before dreamai - log trasnformed data}
+
+vis_miss(prot_data_final_dai_log[, order(colnames(prot_data_final_dai_log))]) +
+  theme(
+    axis.text.x = element_text(size = 4, angle = 90, vjust = 1, hjust = 1),
+    plot.margin = ggplot2::margin(t = 50, r = 5, b = 5, l = 5)
+  )
+```
+
+The graph shows how many missing values are in each sample now, it varies from 3% to 22%, on average 8,4%.
+You can derive from this graph, that the missing values are not missing at random, they follow a pattern.
+
+### Run DreamAI() 
+
+on prot_data_final_dai_log
+
+Install DreamAI:
+
+```{r dream ai requirements, echo=TRUE, results='hide'}
+require("cluster")
+require("survival")
+require("randomForest")
+require("missForest")
+require("glmnet")
+require("Rcpp")
+require("foreach")
+require("itertools")
+require("iterators")
+require("Matrix")
+require("devtools")
+if (!requireNamespace("BiocManager", quietly = TRUE))
+install.packages("BiocManager")
+BiocManager::install("impute") #original code: BiocManager::install("impute", version = "3.8"), caused problems because my R version is newer (4.4) and is only compatible with BiocManager 3.19. If i need the 3.8 version i need to install R 3.5.x
+require("impute")
+BiocManager::version()
+
+```
+Run DreamAI
+```{r run Dream AI on prot_data_final_dai_log , echo=TRUE}
+
+library(DreamAI)
+
+imputed_prot_data_log <- DreamAI(prot_data_final_dai_log, k = 10, maxiter_MF = 10, ntree = 100,
+  maxnodes = NULL, maxiter_ADMIN = 30, tol = 10^(-2),
+  gamma_ADMIN = NA, gamma = 50, CV = FALSE,
+  fillmethod = "row_mean", maxiter_RegImpute = 10,
+  conv_nrmse = 1e-06, iter_SpectroFM = 40, method = c("KNN",
+  "MissForest", "ADMIN", "Birnn", "SpectroFM", "RegImpute"),
+  out = c("Ensemble"))
+
+#imputed_prot_data_log$Ensemble has the new data
+
+#check NAs
+sum(is.na(imputed_prot_data_log$Ensemble))
+
+#make it a dataframe (and later maybe a matrix)
+prot_data_dreamai_log <- imputed_prot_data_log$Ensemble %>%
+  as.data.frame()
+```
+prot_data_dreamai_log is the imputed dataframe to further work with.
+
+```{r reorder cols ascending}
+order_asc = sort(colnames(prot_data_dreamai_log))
+
+prot_data_dreamai_log <- prot_data_dreamai_log[, order_asc]
+```
+
+### PCA after DreamAI
+
+of prot_data_dreamai_log
+
+as a last check to not have batch effects
+standard PCA (bc we have a complete dataset after DreamAI)
+
+```{r standard PCA of prot_data_dreamai_log}
+# Prepare data with scaling
+pca_df_dreamai_log <- prot_data_dreamai_log %>%
+  as.data.frame() %>%
+  rowScales() %>%
+  as.data.frame()
+
+# Run standard PCA using prcomp (base R)
+data_pca_dreamai_log <- prcomp(t(as.matrix(pca_df_dreamai_log)), 
+                                center = FALSE,  # already centered via rowScales
+                                scale. = FALSE)  # already scaled via rowScales
+
+# Extract scores and separate sample IDs
+pca_out_dreamai <- as.data.frame(data_pca_dreamai_log$x[, 1:2]) %>%
+  rownames_to_column("Sample_id") %>%
+  separate(Sample_id, into = c("Plex", "Number"), sep = "_")
+
+# Calculate variance explained
+var_explained <- summary(data_pca_dreamai_log)$importance[2, 1:2] * 100
+
+# Plot
+ggplot(pca_out_dreamai, aes(PC1, PC2, col = Plex)) +
+  geom_point(size = 3) +
+  scale_color_brewer(palette = "Set3") +
+  theme_classic() +
+  xlab(paste0("PC1 (", round(var_explained[1], 2), "%)")) +
+  ylab(paste0("PC2 (", round(var_explained[2], 2), "%)")) +
+  ggtitle("PCA of prot_data_dreamai_log")
+```
+No batch effect visible - which means we can take prot_data_dreamai_log for BayesdeBulk.
+
+
+##BayesDeBulk
+
+https://github.com/WangLab-MSSM/BayesDeBulk.git
+
+using prot_data_dreamai_log and rna_combat
+
+BayesDeBulk expects MATRICES with:
+- Genes as ROWS
+- Samples as COLUMNS
+
+```{r checking prot_data_dreamai_log and rna_combat}
+# Check your data structure
+class(rna_combat)     
+class(prot_data_dreamai_log)      
+
+dim(rna_combat)        
+dim(prot_data_dreamai_log)        
+
+head(rownames(prot_data_dreamai_log)) # Should be gene names
+head(colnames(prot_data_dreamai_log)) # Should be sample names
+
+head(rownames(rna_combat))   # Should be gene names
+head(colnames(rna_combat))   # Should be sample names
+```
+
+run BayesDeBulk
+
+```{r bayesdb with prot_data_dreamai_log, warning=FALSE, message=FALSE, cache = TRUE}
+out <-BayesDeBulk(n.iter=5000, burn.in=2500,
+                  Y=list(rna_combat,prot_data_dreamai_log), 
+                  markers = LM22_markers(list(rna_combat,prot_data_dreamai_log)))
+
+bayesdb_out_log <- out$cell.fraction %>%
+  as.data.frame()
+
+write.csv(bayesdb_out_log, 
+          file = "data/processed_data/bayesdb_out_log.csv", 
+          row.names = TRUE) 
+```
+
+
+
+#### Cell composition data check
+
+```{r bayesdb_out_log data check}
+library(tidyverse)
+
+# 1. Check structure
+dim(bayesdb_out_log)
+colnames(bayesdb_out_log)
+
+# 2. Summary statistics per cell type
+celltype_summary <- bayesdb_out_log %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(-sample, names_to = "cell_type", values_to = "proportion") %>%
+  group_by(cell_type) %>%
+  summarise(
+    median = median(proportion, na.rm = TRUE),
+    mean = mean(proportion, na.rm = TRUE),
+    sd = sd(proportion, na.rm = TRUE),
+    min = min(proportion, na.rm = TRUE),
+    max = max(proportion, na.rm = TRUE),
+    cv = sd / mean * 100
+  ) %>%
+  arrange(desc(median))
+
+print(celltype_summary, n = Inf)
+
+# 3. Boxplot of cell type proportions
+bayesdb_out_log %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(-sample, names_to = "cell_type", values_to = "proportion") %>%
+  ggplot(aes(x = reorder(cell_type, proportion, FUN = median), y = proportion)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_classic() +
+  labs(x = "Cell type", y = "Estimated proportion",
+       title = "Cell type proportions across samples")
+
+# 4. Heatmap
+library(ComplexHeatmap)
+
+Heatmap(
+  t(as.matrix(bayesdb_out_log)),  # transpose so cell types are rows
+  name = "Proportion",
+  row_title = "Cell types",
+  column_title = "Samples",
+  show_column_names = FALSE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE
+)
+
+# 5. Variability plot (coefficient of variation)
+celltype_summary %>%
+  ggplot(aes(x = reorder(cell_type, cv), y = cv)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_classic() +
+  labs(x = "Cell type", y = "Coefficient of variation (%)",
+       title = "Variability of cell type proportions")
+
+# 6. Quick summary for your thesis
+cat("Number of cell types:", ncol(bayesdb_out_log), "\n")
+cat("Number of samples:", nrow(bayesdb_out_log), "\n\n")
+
+cat("Highest median abundance:\n")
+print(head(celltype_summary, 3))
+
+cat("\nLowest median abundance:\n")
+print(tail(celltype_summary, 3))
+
+cat("\nMost variable cell types (highest CV):\n")
+print(celltype_summary %>% arrange(desc(cv)) %>% head(3))
+```
+#### UMAP for plexes
+
+```{r umap for plexes}
+umap_bdb_log <- umap(bayesdb_out_log)
+
+umap_df <- data.frame(
+  UMAP1 = umap_bdb_log$layout[,1],
+  UMAP2 = umap_bdb_log$layout[,2],
+  Sample = rownames(bayesdb_out_log)
+) %>%
+  separate(Sample, into = c("Plex", "Number"), sep = "_", remove = FALSE)
+
+ggplot(umap_df, aes(UMAP1, UMAP2, color = Plex)) +
+  geom_point(size = 2) +
+  scale_color_brewer(palette = "Set3") +
+  theme_classic() +
+  labs(
+    x = "UMAP1",
+    y = "UMAP2",
+    title = "UMAP of bayesdb_out_log colored by Plex"
+  )
+```
+
+
+#### UMAP for single plexes
+
+```{r umap single plexes}
+
+umap_bdb_log <- umap(bayesdb_out_log, n_neighbors = 15)
+
+# Create data frame for plotting
+umap_df <- data.frame(
+  UMAP1 = umap_bdb_log$layout[,1],
+  UMAP2 = umap_bdb_log$layout[,2],
+  Sample = rownames(bayesdb_out_log)
+) %>%
+  separate(Sample, into = c("Plex", "Number"), sep = "_", remove = FALSE) %>%
+  mutate(Highlight = ifelse(Plex %in% c("930", "935"), Plex, "Other"))
+
+# Plot
+ggplot(umap_df, aes(UMAP1, UMAP2, color = Highlight)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("930" = "#E41A1C", "935" = "#377EB8", "Other" = "grey80")) +
+  theme_classic() +
+  labs(
+    x = "UMAP1",
+    y = "UMAP2",
+    title = "UMAP of bayesdb_out_log colored by Plex 930 and 935"
+  )
+```
+
+UMAP of 928:
+```{r UMAP of 928}
+umap_bdb_log <- umap(bayesdb_out_log)
+
+umap_df <- data.frame(
+  UMAP1 = umap_bdb_log$layout[,1],
+  UMAP2 = umap_bdb_log$layout[,2],
+  Sample = rownames(bayesdb_out_log)
+) %>%
+  separate(Sample, into = c("Plex", "Number"), sep = "_", remove = FALSE) %>%
+  mutate(Highlight = ifelse(Plex %in% c("928"), Plex, "Other"))
+
+ggplot(umap_df, aes(UMAP1, UMAP2, color = Highlight)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("928" = "#E41A1C", "Other" = "grey80")) +
+  theme_classic() +
+  labs(
+    x = "UMAP1",
+    y = "UMAP2",
+    title = "UMAP of bayesdb_out_log colored by Plex 928"
+  )
+```
+UMAP of 775
+```{r umap of 775}
+umap_bdb_log <- umap(bayesdb_out_log)
+
+umap_df <- data.frame(
+  UMAP1 = umap_bdb_log$layout[,1],
+  UMAP2 = umap_bdb_log$layout[,2],
+  Sample = rownames(bayesdb_out_log)
+) %>%
+  separate(Sample, into = c("Plex", "Number"), sep = "_", remove = FALSE) %>%
+  mutate(Highlight = ifelse(Plex %in% c("775"), Plex, "Other"))
+
+ggplot(umap_df, aes(UMAP1, UMAP2, color = Highlight)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("775" = "#E41A1C", "Other" = "grey80")) +
+  theme_classic() +
+  labs(
+    x = "UMAP1",
+    y = "UMAP2",
+    title = "UMAP of bayesdb_out_log colored by Plex 775"
+  )
+```
+
+There are no big batch effects visible.
+
+#### UMAP lab origin
+```{r umap lab origin}
+umap_df <- data.frame(
+  UMAP1 = umap_bdb_log$layout[,1],
+  UMAP2 = umap_bdb_log$layout[,2],
+  Sample = rownames(bayesdb_out_log)
+) %>%
+  mutate(Lab = ifelse(substr(Sample, 1, 1) == "9", "RNA_1", "RNA_2"))
+
+ggplot(umap_df, aes(UMAP1, UMAP2, color = Lab)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("RNA_1" = "#E41A1C", "RNA_2" = "#377EB8")) +
+  theme_classic() +
+  labs(
+    x = "UMAP1",
+    y = "UMAP2",
+    title = "UMAP of bayesdb_out_log - colored by RNA source lab"
+  )
+```
+
+#### Scaled UMAPs
+
+```{r scaled bayesdb umaps}
+# Scaled UMAP
+set.seed(123)
+
+bayesdb_log_scaled <- scale(bayesdb_out_log)
+umap_scaled <- umap(bayesdb_log_scaled)
+
+# Base data frame
+umap_base <- data.frame(
+  UMAP1 = umap_scaled$layout[,1],
+  UMAP2 = umap_scaled$layout[,2],
+  Sample = rownames(bayesdb_log_scaled)
+) %>%
+  separate(Sample, into = c("Plex", "Number"), sep = "_", remove = FALSE) %>%
+  mutate(
+    Lab = ifelse(substr(Sample, 1, 1) == "9", "RNA_1", "RNA_2"),
+    Highlight_930_935 = case_when(
+      Plex == "930" ~ "930",
+      Plex == "935" ~ "935",
+      TRUE ~ "Other"
+    ),
+    Highlight_928 = ifelse(Plex == "928", "928", "Other"),
+    Highlight_775 = ifelse(Plex == "775", "775", "Other")
+  )
+
+# 1. Plex 930 and 935
+p1 <- ggplot(umap_base, aes(UMAP1, UMAP2, color = Highlight_930_935)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("930" = "#E41A1C", "935" = "#377EB8", "Other" = "grey80"), name = "Plex") +
+  theme_classic() +
+  labs(title = "Plex 930 & 935")
+
+# 2. Plex 928
+p2 <- ggplot(umap_base, aes(UMAP1, UMAP2, color = Highlight_928)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("928" = "#E41A1C", "Other" = "grey80"), name = "Plex") +
+  theme_classic() +
+  labs(title = "Plex 928")
+
+# 3. Plex 775
+p3 <- ggplot(umap_base, aes(UMAP1, UMAP2, color = Highlight_775)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("775" = "#E41A1C", "Other" = "grey80"), name = "Plex") +
+  theme_classic() +
+  labs(title = "Plex 775")
+
+# 4. All plexes
+p4 <- ggplot(umap_base, aes(UMAP1, UMAP2, color = Plex)) +
+  geom_point(size = 2) +
+  scale_color_brewer(palette = "Set3") +
+  theme_classic() +
+  labs(title = "All Plexes")
+
+# 5. RNA source lab
+p5 <- ggplot(umap_base, aes(UMAP1, UMAP2, color = Lab)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("RNA_1" = "#E41A1C", "RNA_2" = "#377EB8")) +
+  theme_classic() +
+  labs(title = "RNA Source Lab")
+
+# Combine all
+library(patchwork)
+(p1 + p2) / p3 +
+  plot_annotation(title = "UMAP of bayesdb_out_log (scaled)", theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+
+(p4 + p5) +
+  plot_annotation(title = "UMAP of bayesdb_out_log (scaled)", theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+
+(p1 + p2) / (p4 + p5) +
+  plot_annotation(title = "UMAP of bayesdb_out_log (scaled)", theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+```
+
+## Cola clustering
+on bayesdb_out_log
+
+```{r cola on bayesdb_out_log}
+library(cola)
+library(dplyr)
+
+graphics.off()
+
+bayesdb_mat_log <- bayesdb_out_log %>%
+  as.matrix() %>%
+  t()  
+
+# set seed for reproducibility!
+set.seed(123) 
+
+# to prevent the error message "#> Error in dev.off(i2): cannot shut down device 1 (the null device)"
+while (!is.null(dev.list()))  dev.off()
+
+#run cola
+rl_bayesdb_log <- run_all_consensus_partition_methods(
+  bayesdb_mat_log,
+  top_value_method = c("SD", "MAD", "ATC"), 
+  partition_method = c("hclust", "kmeans", "skmeans"),
+  max_k = 6, 
+  scale_rows = TRUE,
+  cores = 4
+)
+# Generate full report
+cola_report(rl_bayesdb_log, output_dir = "data/processed_data/cola_bayesdb_log", cores = 4)
+
+best_results_bdb_log <- suggest_best_k(rl_bayesdb_log)
+head(best_results_bdb_log, 5)
+
+```
+
+

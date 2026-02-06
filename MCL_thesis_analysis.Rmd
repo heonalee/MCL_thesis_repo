@@ -1682,7 +1682,7 @@ library(patchwork)
 ## Cola clustering
 on bayesdb_out_log
 
-```{r cola on bayesdb_out_log}
+```{r cola on bayesdb_out_log, cache = TRUE}
 library(cola)
 library(dplyr)
 
@@ -1707,11 +1707,14 @@ rl_bayesdb_log <- run_all_consensus_partition_methods(
   scale_rows = TRUE,
   cores = 4
 )
-# Generate full report
-cola_report(rl_bayesdb_log, output_dir = "data/processed_data/cola_bayesdb_log", cores = 4)
 
 best_results_bdb_log <- suggest_best_k(rl_bayesdb_log)
 head(best_results_bdb_log, 5)
+```
+```{r cola-report, eval=FALSE}
+# Generate full report
+# eval = FALSE because of knitting problem
+cola_report(rl_bayesdb_log, output_dir = "data/processed_data/cola_bayesdb_log", cores = 4)
 
 ```
 

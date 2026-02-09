@@ -20,7 +20,7 @@ MCL_thesis_repo/
 ## Interactive Reports
 
 The cola report could not be displayed fully in my docs/ folder. Here is the link to the full report:
-- [Cola Consensus Clustering Report](file:///Users/heona/git-repos/MCL_thesis_repo/docs/cola_bayesdb_log/cola_report.html)
+- file:///Users/heona/git-repos/MCL_thesis_repo/docs/cola_bayesdb_log/cola_report.html
 
 ## Methods
 
